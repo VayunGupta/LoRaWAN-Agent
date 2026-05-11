@@ -1,4 +1,6 @@
 # src/helpers.py
+from __future__ import annotations
+
 import os, glob, json, numpy as np, pandas as pd
 from math import radians, cos, sin, asin, sqrt
 
@@ -36,6 +38,7 @@ def load_pair_parquet(path):
         'SNR (dB)'                : 'snr_db',
         'Frequency (Hz)'          : 'freq_hz',
         'Timestamp'               : 'timestamp',
+        'Counter (-)'             : 'counter',
         'Spreading Factor (-)'    : 'sf',
         'Bandwidth (Hz)'          : 'bw_hz',
         '# Receiving Gateways (-)': 'n_rx_gw',
@@ -72,7 +75,7 @@ def load_pair_parquet(path):
         c for c in [
             'sensor','gateway','timestamp',
             'rssi_dbm','snr_db',
-            'freq_hz','bw_hz','sf','n_rx_gw'
+            'freq_hz','bw_hz','sf','n_rx_gw','counter'
         ] if c in df.columns
     ]
 
@@ -144,12 +147,20 @@ def load_and_prepare_packets(
     target_freq_mhz: float = TARGET_FREQ_MHZ,
     outlier_db: float = OUTLIER_DB,
     min_pkts: int = MIN_PKTS,
+    attack_type: str = "none",
     attack_scope: str = "global",
     attack_sensor: str = None,
     attack_gateway: str = None,
+    attack_sensors: list[str] | None = None,
+    attack_gateways: list[str] | None = None,
     rssi_shift_db: float = 0.0,
     rssi_noise_sigma_db: float = 0.0,
     drop_prob: float = 0.0,
+    replay_fraction: float = 0.0,
+    replay_delay_s: float = 0.0,
+    fabricate_fraction: float = 0.0,
+    fabricate_shift_db: float = 8.0,
+    counter_shift: int = 0,
     seed: int = 0,
 ) -> pd.DataFrame:
     """
@@ -173,17 +184,19 @@ def load_and_prepare_packets(
     scope = attack_scope
     s = attack_sensor
     g = attack_gateway
+    sensor_targets = list(attack_sensors or ([] if attack_sensor is None else [attack_sensor]))
+    gateway_targets = list(attack_gateways or ([] if attack_gateway is None else [attack_gateway]))
 
     if scope == "global":
         mask = np.ones(len(raw), dtype=bool)
     elif scope == "sensor":
-        if not s:
-            raise ValueError("attack_scope='sensor' requires attack_sensor")
-        mask = (raw["sensor"] == s).to_numpy()
+        if not sensor_targets:
+            raise ValueError("attack_scope='sensor' requires attack_sensor or attack_sensors")
+        mask = raw["sensor"].isin(sensor_targets).to_numpy()
     elif scope == "gateway":
-        if not g:
-            raise ValueError("attack_scope='gateway' requires attack_gateway")
-        mask = (raw["gateway"] == g).to_numpy()
+        if not gateway_targets:
+            raise ValueError("attack_scope='gateway' requires attack_gateway or attack_gateways")
+        mask = raw["gateway"].isin(gateway_targets).to_numpy()
     elif scope == "link":
         if not s or not g:
             raise ValueError("attack_scope='link' requires attack_sensor and attack_gateway")
@@ -192,25 +205,62 @@ def load_and_prepare_packets(
         raise ValueError(f"Unknown attack_scope: {scope}")
 
     # ----------------------------
+    # Attack aliases for richer cross-gateway consistency attacks
+    # ----------------------------
+    if attack_type == "selective_suppression" and drop_prob <= 0.0:
+        drop_prob = 0.45
+    if attack_type == "replay_attack" and replay_fraction <= 0.0:
+        replay_fraction = 0.12
+    if attack_type == "delayed_replay":
+        if replay_fraction <= 0.0:
+            replay_fraction = 0.12
+        if replay_delay_s <= 0.0:
+            replay_delay_s = 180.0
+    if attack_type == "gateway_fabrication" and fabricate_fraction <= 0.0:
+        fabricate_fraction = 0.10
+    if attack_type == "counter_corruption" and counter_shift == 0:
+        counter_shift = -7
+
+    # ----------------------------
     # Packet drop / jamming (drop targeted packets)
     # ----------------------------
+    drop_mask = mask.copy()
+    if attack_type == "selective_suppression" and mask.any():
+        rng = np.random.default_rng(int(seed) + 17)
+        targeted = raw.loc[mask].copy()
+        targeted_sensors = sorted(targeted["sensor"].unique().tolist())
+        if targeted_sensors:
+            select_count = max(1, int(np.ceil(len(targeted_sensors) / 3.0)))
+            selected_sensors = set(
+                rng.choice(targeted_sensors, size=min(select_count, len(targeted_sensors)), replace=False).tolist()
+            )
+            selective_mask = mask & raw["sensor"].isin(selected_sensors).to_numpy()
+            if "timestamp" in raw.columns and selective_mask.any():
+                selective_times = pd.to_datetime(raw.loc[selective_mask, "timestamp"], utc=True)
+                median_time = selective_times.median()
+                selective_mask &= (pd.to_datetime(raw["timestamp"], utc=True) >= median_time).to_numpy()
+            elif "counter" in raw.columns and selective_mask.any():
+                selective_mask &= ((raw["counter"].fillna(0).astype(int) % 2) == 0).to_numpy()
+            if selective_mask.any():
+                drop_mask = selective_mask
+
     if drop_prob and drop_prob > 0.0:
         if not (0.0 < drop_prob < 1.0):
             raise ValueError("drop_prob must be in (0,1)")
         rng = np.random.default_rng(int(seed))
         keep = np.ones(len(raw), dtype=bool)
         # only drop within mask
-        drop_draw = rng.random(mask.sum())
-        keep_idx = np.where(mask)[0]
+        drop_draw = rng.random(drop_mask.sum())
+        keep_idx = np.where(drop_mask)[0]
         keep[keep_idx] = drop_draw >= float(drop_prob)
         raw = raw.loc[keep].copy()
         # recompute mask after dropping (indices changed)
         if scope == "global":
             mask = np.ones(len(raw), dtype=bool)
         elif scope == "sensor":
-            mask = (raw["sensor"] == s).to_numpy()
+            mask = raw["sensor"].isin(sensor_targets).to_numpy()
         elif scope == "gateway":
-            mask = (raw["gateway"] == g).to_numpy()
+            mask = raw["gateway"].isin(gateway_targets).to_numpy()
         else:
             mask = ((raw["sensor"] == s) & (raw["gateway"] == g)).to_numpy()
 
@@ -227,6 +277,62 @@ def load_and_prepare_packets(
         rng = np.random.default_rng(int(seed))
         noise = rng.normal(loc=0.0, scale=float(rssi_noise_sigma_db), size=int(mask.sum()))
         raw.loc[mask, "rssi_dbm"] = raw.loc[mask, "rssi_dbm"] + noise
+
+    # ----------------------------
+    # Replay-style attacks: duplicate targeted observations later in time
+    # ----------------------------
+    if replay_fraction and replay_fraction > 0.0 and 'timestamp' in raw.columns:
+        candidate = raw.loc[mask].copy()
+        if not candidate.empty:
+            rng = np.random.default_rng(int(seed) + 101)
+            replay_n = max(1, int(round(candidate.shape[0] * float(replay_fraction))))
+            replay = candidate.sample(n=min(replay_n, candidate.shape[0]), random_state=int(seed) + 101).copy()
+            default_delay = 45.0 if attack_type == "replay_attack" else 180.0
+            delay_s = float(replay_delay_s if replay_delay_s > 0.0 else default_delay)
+            replay["timestamp"] = pd.to_datetime(replay["timestamp"], utc=True) + pd.to_timedelta(delay_s, unit="s")
+            # Make the replay visibly implausible by slightly perturbing the duplicated reception metadata.
+            if "rssi_dbm" in replay.columns:
+                replay["rssi_dbm"] = replay["rssi_dbm"] + rng.normal(loc=0.0, scale=1.25, size=replay.shape[0])
+            if "snr_db" in replay.columns:
+                replay["snr_db"] = replay["snr_db"] + rng.normal(loc=0.0, scale=0.75, size=replay.shape[0])
+            raw = pd.concat([raw, replay], ignore_index=True)
+
+    # ----------------------------
+    # Gateway fabrication: create new gateway-side witnesses for packets that
+    # were observed elsewhere, but perturb their physical evidence.
+    # ----------------------------
+    if fabricate_fraction and fabricate_fraction > 0.0:
+        if not gateway_targets:
+            raise ValueError("gateway_fabrication requires attack_gateway or attack_gateways")
+        source = raw.loc[~raw["gateway"].isin(gateway_targets)].copy()
+        if attack_sensor:
+            source = source.loc[source["sensor"] == attack_sensor]
+        if not source.empty:
+            fabricate_n = max(1, int(round(source.shape[0] * float(fabricate_fraction))))
+            fabricated = source.sample(
+                n=min(fabricate_n, source.shape[0]),
+                random_state=int(seed) + 211,
+            ).copy()
+            rng = np.random.default_rng(int(seed) + 211)
+            fabricated["gateway"] = rng.choice(gateway_targets, size=fabricated.shape[0], replace=True)
+            if "timestamp" in fabricated.columns:
+                fabricated["timestamp"] = pd.to_datetime(fabricated["timestamp"], utc=True) + pd.to_timedelta(
+                    rng.uniform(0.5, 3.0, size=fabricated.shape[0]),
+                    unit="s",
+                )
+            if "rssi_dbm" in fabricated.columns:
+                fabricated["rssi_dbm"] = fabricated["rssi_dbm"] + float(fabricate_shift_db)
+            if "snr_db" in fabricated.columns:
+                fabricated["snr_db"] = fabricated["snr_db"] + rng.normal(loc=-1.5, scale=1.0, size=fabricated.shape[0])
+            if "n_rx_gw" in fabricated.columns:
+                fabricated["n_rx_gw"] = fabricated["n_rx_gw"].clip(lower=1) + 1
+            raw = pd.concat([raw, fabricated], ignore_index=True)
+
+    # ----------------------------
+    # Counter corruption: break packet identity continuity on the targeted view
+    # ----------------------------
+    if counter_shift and counter_shift != 0 and "counter" in raw.columns:
+        raw.loc[mask, "counter"] = raw.loc[mask, "counter"] + int(counter_shift)
 
     # Recompute freq_mhz because load_all_pairs already frequency_filter'ed
     raw["freq_mhz"] = (raw["freq_hz"] / 1e6).round(0)
@@ -264,7 +370,7 @@ def load_and_prepare_packets(
     keep_cols = [c for c in [
     'sensor','gateway','timestamp',
     'rssi_dbm','snr_db','freq_mhz',
-    'bw_hz','sf','n_rx_gw'          
+    'bw_hz','sf','n_rx_gw','counter'
     ] if c in trimmed.columns]
     return trimmed[keep_cols]
 
@@ -303,5 +409,3 @@ def summarize_pairs_to_csv(pairs_df: pd.DataFrame, out_csv: str):
         agg = agg.merge(dom_sf, on='sensor', how='left')
 
     agg.to_csv(out_csv, index=False)
-
-

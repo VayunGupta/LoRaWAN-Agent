@@ -1,6 +1,7 @@
 .venv/
 .matplotlib/
 outputs/
+models/sam/*.pth
 
 __pycache__/
 *.py[cod]
@@ -26,6 +27,8 @@ paper/*.fdb_latexmk
 paper/*.fls
 paper/*.log
 paper/*.out
+paper/*.bbl
+paper/*.blg
 paper/*.pdf
 paper/*.synctex.gz
 

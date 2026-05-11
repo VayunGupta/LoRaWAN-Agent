@@ -140,14 +140,16 @@ class OllamaAdjudicator:
         allowed_tools: list[str],
     ) -> str:
         return (
-            "You are an LoRaWAN attack adjudicator. "
-            "Use only the supplied evidence. Do not invent measurements, sensors, gateways, or tools.\n\n"
+            "You are a bounded LoRaWAN attack adjudicator. "
+            "Use only the supplied derived evidence. Do not invent measurements, sensors, gateways, true labels, or tools.\n\n"
             f"Mode: {mode}\n"
             f"Allowed final labels: {allowed_labels}\n"
             f"Allowed next tools: {allowed_tools}\n"
             "Rules:\n"
             "- Cite evidence only by exact keys from the evidence object.\n"
             "- If evidence is conflicting, set request_more_evidence to true.\n"
+            "- Prefer the heuristic label when the evidence is weak or environmentally plausible.\n"
+            "- Use path context only as supporting evidence; it does not override packet-loss or geometry evidence by itself.\n"
             "- In explanation mode, keep the heuristic label and provide rationale only.\n"
             "- Return JSON only with keys: final_label, confidence, rationale, evidence_used, request_more_evidence, next_tool.\n\n"
             f"Payload:\n{json.dumps(payload, indent=2, sort_keys=True)}"

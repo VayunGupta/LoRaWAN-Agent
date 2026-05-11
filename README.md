@@ -1,99 +1,215 @@
-## ReAct LoRaWAN Agent
+# LoRaMAS: Multi-Agent Verification for LoRaWAN Security
 
-This repo is now centered on a server-side ReAct agent that coordinates gateway observations, detects synthetic attacks injected from `dataset/lorawan_metadata`, and explains the action sequence it used to justify the decision.
+Repository: https://github.com/Vayung2/LoRaWAN-Agent
 
-The detector is intentionally two-stage:
+This repository contains the implementation and paper source for LoRaMAS, a
+server-side multi-agent verifier for LoRaWAN location-trust experiments. The
+system evaluates real UVA LoRaWAN packet traces, injects controlled verification
+attacks, and compares RF-only baselines against a supervisor that combines
+gateway-local RF evidence, temporal packet-witness evidence, trilateration
+residuals, and satellite/SAM-derived environmental context.
 
-- deterministic RF heuristics remain the first-stage measurement and calibration anchor
-- an optional local LLM only runs on ambiguous cases to adjudicate conflicts and explain the evidence
+## Repository Layout
 
-### Core idea
+```text
+dataset/                 UVA LoRaWAN metadata, packet traces, and weather files
+models/                  Metadata and calibrated path-loss parameters
+paper/                   LaTeX report, bibliography, and paper figures
+scripts/                 Reproducibility scripts for results and figures
+src/                     LoRaMAS implementation and baseline evaluators
+src/react_agent/         Supervisor, specialist roles, tools, trust verifier
+src/traditional/         Path-loss, trilateration, and calibration baselines
+```
 
-- The server loads a clean baseline snapshot from the dataset.
-- A synthetic scenario is created by perturbing RSSI or packet volume during load time.
-- The ReAct agent inspects network-wide gateway evidence, drills into suspicious sensors and gateways, runs trilateration, and emits an explicit reasoning trace.
+Generated outputs are written under `outputs/` and are intentionally ignored by
+git. The SAM checkpoint is also ignored because it is a large downloaded model.
 
-### Setup
+## Setup
 
-1. Create a virtual environment and install `requirements.txt`.
-2. Make sure `models/metadata.json` and `models/traditional_params.json` exist.
+From the repository root:
 
-If you need to rebuild metadata:
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+The checked-in repository already includes:
+
+- `dataset/lorawan_metadata/*.parquet`
+- `dataset/weather/deployment_weather.parquet`
+- `models/metadata.json`
+- `models/traditional_params.json`
+- `paper/main.tex`
+- `paper/refs.bib`
+
+If metadata or calibration files need to be rebuilt:
 
 ```bash
 python -m src.build_metadata
+python -m src.traditional.calibrate \
+  --data_dir dataset/lorawan_metadata \
+  --meta models/metadata.json \
+  --out models/traditional_params.json
 ```
 
-If you need to recalibrate the traditional path-loss model:
+## Quick Smoke Test
+
+Run a clean LoRaMAS verification pass:
 
 ```bash
-python -m src.traditional.calibrate --data_dir dataset/lorawan_metadata --meta models/metadata.json --out models/traditional_params.json
+python -m src.run_react_agent \
+  --attack-type none \
+  --llm-mode off \
+  --architecture loramas
 ```
 
-### Run the ReAct agent
-
-Baseline check:
+Run one sensor-side attack:
 
 ```bash
-python3 -m src.run_react_agent --attack-type none
+python -m src.run_react_agent \
+  --attack-type sensor_foil \
+  --sensor sensor08 \
+  --rssi-shift-db -12 \
+  --llm-mode off \
+  --architecture loramas \
+  --json-out outputs/sensor08_sensor_foil_report.json
 ```
 
-Synthetic sensor foil example:
+The command prints the supervisor decision, specialist-agent claims, cited
+evidence keys, and the reasoning trace. The JSON file contains the same report
+in machine-readable form.
+
+## Main Experiment Commands
+
+Run the paper-facing benchmark used for the MAS results table:
 
 ```bash
-python3 -m src.run_react_agent --attack-type sensor_foil --sensor sensor08 --rssi-shift-db -12
+python -m src.evaluate_react_agent \
+  --scenario-set benchmark \
+  --benchmark-split all \
+  --architectures localization_only centralized_trust loramas loramas_no_temporal loramas_no_physical \
+  --role-reasoning rules \
+  --modes off \
+  --use-environment-context \
+  --out-dir outputs/neurips_benchmark_rules
 ```
 
-Synthetic gateway bias example:
+Important outputs:
+
+- `outputs/neurips_benchmark_rules/react_eval_run_summary.csv`
+- `outputs/neurips_benchmark_rules/react_eval_rows.csv`
+
+Run representative single-case traces for manual inspection:
 
 ```bash
-python3 -m src.run_react_agent --attack-type gateway_bias --gateway gatewayA --rssi-shift-db -10
+bash scripts/run_representative_results.sh
 ```
 
-Synthetic packet drop example:
+This writes human-readable traces to:
+
+```text
+outputs/logs/representative_results/
+```
+
+## Satellite/SAM Environment Context
+
+The Environment Agent can use a cached satellite-context table. To build it,
+download Meta's public SAM ViT-B checkpoint first:
 
 ```bash
-python3 -m src.run_react_agent --attack-type packet_drop --gateway gatewayB --drop-prob 0.7 --seed 7
+mkdir -p models/sam
+curl -L https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth \
+  -o models/sam/sam_vit_b_01ec64.pth
 ```
 
-Synthetic random noise example:
+Then run:
 
 ```bash
-python3 -m src.run_react_agent --attack-type random_noise --sensor sensor05 --noise-sigma-db 6 --seed 7
+MPLCONFIGDIR=/private/tmp/mpl python scripts/build_satellite_context.py \
+  --segmentation-mode sam \
+  --sam-max-side 768
 ```
 
-Optional JSON report output:
+This writes:
+
+- `outputs/satellite_context/uva_satellite.png`
+- `outputs/satellite_context/satellite_context_by_pair.csv`
+- `outputs/satellite_context/sam_building_mask.png`
+- `outputs/satellite_context/sam_vegetation_mask.png`
+- `outputs/satellite_context/satellite_los_overlay.png`
+- `paper/satellite_los_overlay.png`
+
+When `--use-environment-context` is enabled, the verifier reads
+`outputs/satellite_context/satellite_context_by_pair.csv` if it exists. If that
+file is missing, it falls back to the older OpenStreetMap-only context.
+
+## One-Command Paper Result Bundle
+
+To regenerate the localization summaries, localization-threshold detector,
+satellite context, and MAS benchmark bundle used by `paper/main.tex`:
 
 ```bash
-python3 -m src.run_react_agent --attack-type sensor_foil --sensor sensor08 --rssi-shift-db -12 --json-out outputs/sensor08_report.json
+python scripts/run_main_tex_results.py --out-dir outputs/main_tex_results
 ```
 
-### LLM modes
+For a fast sanity check:
 
-The agent supports three modes:
+```bash
+python scripts/run_main_tex_results.py \
+  --quick \
+  --skip-satellite \
+  --out-dir outputs/main_tex_results_quick
+```
 
-- `--llm-mode off`: pure heuristic baseline
-- `--llm-mode explain`: keep the heuristic label and use the LLM only for rationale on ambiguous cases
-- `--llm-mode adjudicate`: allow the LLM to override the heuristic only on ambiguous cases, with deterministic fallback if Ollama is unavailable or malformed
+The full run writes a checklist here:
+
+```text
+outputs/main_tex_results/RESULTS_FOR_MAIN_TEX.md
+```
+
+## Compile the Paper
+
+The report source is `paper/main.tex`.
+
+```bash
+cd paper
+latexmk -pdf -interaction=nonstopmode main.tex
+```
+
+The compiled PDF is `paper/main.pdf`. Build artifacts such as `.aux`, `.bbl`,
+`.blg`, `.log`, and `.pdf` are ignored by git; commit `main.tex`, `refs.bib`,
+and the paper figures instead.
+
+## LLM Modes
+
+The default paper results use deterministic specialist-role rules. Optional LLM
+support is available through a local Ollama endpoint:
+
+- `--llm-mode off`: deterministic verifier only
+- `--llm-mode explain`: deterministic label with optional LLM rationale
+- `--llm-mode adjudicate`: bounded LLM override only on ambiguous cases
+- `--role-reasoning llm`: rewrite specialist claims using the configured model
 
 Example:
 
 ```bash
-python3 -m src.run_react_agent --attack-type random_noise --sensor sensor05 --noise-sigma-db 6 --llm-mode adjudicate --llm-model qwen2.5:7b
+python -m src.run_react_agent \
+  --attack-type random_noise \
+  --sensor sensor05 \
+  --noise-sigma-db 6 \
+  --architecture loramas \
+  --llm-mode adjudicate \
+  --llm-model qwen2.5:7b
 ```
 
-### Ablation evaluation
+If Ollama is unavailable or returns malformed output, the implementation falls
+back to the deterministic verifier.
 
-To compare heuristic-only, explanation-only, and adjudication settings:
+## Notes Before Pushing
 
-```bash
-python3 -m src.evaluate_react_agent --json-out outputs/eval_summary.json
-```
-
-The evaluation summary reports:
-
-- overall label accuracy
-- ambiguous-case accuracy
-- false-positive rate on clean and weak-noise benign scenarios
-- LLM invocation rate
-- explanation faithfulness rate based on cited evidence keys
+- Do not commit `models/sam/*.pth`; the README download command recreates it.
+- Do not commit `outputs/`; all experiment outputs can be regenerated.
+- Commit the source code, `requirements.txt`, `models/*.json`, dataset files,
+  `paper/main.tex`, `paper/refs.bib`, and the paper figures used by LaTeX.
