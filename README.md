@@ -206,10 +206,5 @@ python -m src.run_react_agent \
 
 If Ollama is unavailable or returns malformed output, the implementation falls
 back to the deterministic verifier.
-
-## Notes Before Pushing
-
-- Do not commit `models/sam/*.pth`; the README download command recreates it.
-- Do not commit `outputs/`; all experiment outputs can be regenerated.
-- Commit the source code, `requirements.txt`, `models/*.json`, dataset files,
+ `requirements.txt`, `models/*.json`, dataset files,
   `paper/main.tex`, `paper/refs.bib`, and the paper figures used by LaTeX.
